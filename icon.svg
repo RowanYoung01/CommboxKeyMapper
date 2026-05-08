@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <radialGradient id="btnGrad" cx="44%" cy="38%" r="60%">
+      <stop offset="0%" stop-color="#5EEAA0"/>
+      <stop offset="100%" stop-color="#2BAF65"/>
+    </radialGradient>
+    <radialGradient id="bgGrad" cx="50%" cy="30%" r="80%">
+      <stop offset="0%" stop-color="#252840"/>
+      <stop offset="100%" stop-color="#13151F"/>
+    </radialGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="256" height="256" rx="52" fill="url(#bgGrad)"/>
+
+  <!-- Outer glow ring -->
+  <circle cx="128" cy="118" r="78" fill="none" stroke="#44D282" stroke-width="2" opacity="0.25"/>
+  <circle cx="128" cy="118" r="68" fill="none" stroke="#44D282" stroke-width="1.5" opacity="0.15"/>
+
+  <!-- PTT button shadow/base -->
+  <circle cx="128" cy="122" r="58" fill="#1A1D2E" opacity="0.7"/>
+
+  <!-- PTT button body -->
+  <circle cx="128" cy="118" r="56" fill="#1E2235" filter="url(#shadow)"/>
+  <circle cx="128" cy="118" r="54" fill="#252840"/>
+
+  <!-- Button rim -->
+  <circle cx="128" cy="118" r="54" fill="none" stroke="#44D282" stroke-width="3" opacity="0.8"/>
+
+  <!-- Green button cap -->
+  <circle cx="128" cy="115" r="42" fill="url(#btnGrad)" filter="url(#glow)"/>
+
+  <!-- Key symbol on button -->
+  <!-- Key bow (ring) -->
+  <circle cx="128" cy="106" r="13" fill="none" stroke="#0D1018" stroke-width="5.5"/>
+  <circle cx="128" cy="106" r="8" fill="#0D1018"/>
+  <!-- Key shaft -->
+  <rect x="124.5" y="117" width="7" height="18" rx="2" fill="#0D1018"/>
+  <!-- Key teeth -->
+  <rect x="131.5" y="125" width="6" height="4" rx="1.5" fill="#0D1018"/>
+  <rect x="131.5" y="131" width="4" height="4" rx="1.5" fill="#0D1018"/>
+
+  <!-- Highlight glare on button -->
+  <ellipse cx="116" cy="100" rx="12" ry="7" fill="white" opacity="0.18" transform="rotate(-20 116 100)"/>
+
+  <!-- Radio waves at bottom -->
+  <path d="M 72 196 Q 128 178 184 196" fill="none" stroke="#44D282" stroke-width="4" stroke-linecap="round" opacity="0.7"/>
+  <path d="M 88 210 Q 128 196 168 210" fill="none" stroke="#44D282" stroke-width="3.5" stroke-linecap="round" opacity="0.5"/>
+  <path d="M 104 222 Q 128 214 152 222" fill="none" stroke="#44D282" stroke-width="3" stroke-linecap="round" opacity="0.35"/>
+
+  <!-- Bottom label -->
+  <text x="128" y="248" font-family="'Segoe UI', Arial, sans-serif" font-size="13" font-weight="600"
+        fill="#44D282" text-anchor="middle" opacity="0.6" letter-spacing="3">ACU-624</text>
+</svg>
