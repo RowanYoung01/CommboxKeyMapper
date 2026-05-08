@@ -48,9 +48,22 @@
                 <Border DockPanel.Dock="Top"
                         Padding="10,4"
                         BorderBrush="#3F3F46" BorderThickness="0,0,0,1">
-                    <TextBlock Text="Activity Log"
-                               FontSize="11" FontWeight="SemiBold"
-                               Foreground="#9090A0" />
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="6">
+                            <Button x:Name="_logCopyBtn"
+                                    Content="Copy All"
+                                    FontSize="10" Padding="6,2"
+                                    ToolTip.Tip="Copy all log entries to clipboard" />
+                            <Button x:Name="_logClearBtn"
+                                    Content="Clear"
+                                    FontSize="10" Padding="6,2"
+                                    ToolTip.Tip="Clear the activity log" />
+                        </StackPanel>
+                        <TextBlock Text="Activity Log"
+                                   FontSize="11" FontWeight="SemiBold"
+                                   Foreground="#9090A0"
+                                   VerticalAlignment="Center" />
+                    </DockPanel>
                 </Border>
                 <ListBox x:Name="_logBox"
                          BorderThickness="0" Padding="4,2"
@@ -58,10 +71,11 @@
                          ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <TextBlock Text="{Binding}"
-                                       FontFamily="Consolas,Menlo,monospace"
-                                       FontSize="11"
-                                       Foreground="#72C882" />
+                            <SelectableTextBlock Text="{Binding}"
+                                                 FontFamily="Consolas,Menlo,monospace"
+                                                 FontSize="11"
+                                                 Foreground="#72C882"
+                                                 TextWrapping="Wrap" />
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>
@@ -148,13 +162,11 @@
                 <!-- Device display -->
                 <Border BorderBrush="#3F3F46" BorderThickness="0,0,0,1"
                         Padding="10,8">
-                    <Grid ColumnDefinitions="Auto,12,Auto,8,*,8,Auto,8,Auto">
-                        <TextBlock Grid.Column="0"
-                                   Text="Display"
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <TextBlock Text="Display"
                                    Classes="header"
                                    VerticalAlignment="Center" />
-                        <Border Grid.Column="2"
-                                Background="#050F08"
+                        <Border Background="#050F08"
                                 BorderBrush="#1A3A1E" BorderThickness="1"
                                 Padding="10,4" CornerRadius="3">
                             <TextBlock x:Name="_displayPreview"
@@ -164,24 +176,7 @@
                                        LineHeight="16"
                                        Foreground="#44D282" />
                         </Border>
-                        <TextBox x:Name="_displayTextBox"
-                                 Grid.Column="4"
-                                 MaxLength="16"
-                                 FontFamily="Consolas,monospace"
-                                 FontSize="11"
-                                 VerticalAlignment="Center"
-                                 Text="                " />
-                        <CheckBox x:Name="_displayAutoChk"
-                                  Grid.Column="6"
-                                  Content="Auto"
-                                  IsChecked="True"
-                                  VerticalAlignment="Center" />
-                        <Button x:Name="_sendDisplayBtn"
-                                Grid.Column="8"
-                                Content="Send"
-                                VerticalAlignment="Center"
-                                Padding="12,5" />
-                    </Grid>
+                    </StackPanel>
                 </Border>
 
                 <!-- Audio levels -->
@@ -232,9 +227,6 @@
                             <TextBlock Text="Sidetone"
                                        Classes="header"
                                        VerticalAlignment="Center" />
-                            <CheckBox x:Name="_sidetoneChk"
-                                      Content="Enable"
-                                      VerticalAlignment="Center" />
                             <TextBlock Text="Volume:"
                                        Classes="subtle"
                                        VerticalAlignment="Center" />
@@ -245,6 +237,11 @@
                                        Text="50 %"
                                        Classes="mono"
                                        VerticalAlignment="Center" MinWidth="36" />
+                            <Button x:Name="_sidetoneResetBtn"
+                                    Content="Reset"
+                                    VerticalAlignment="Center"
+                                    Padding="10,4"
+                                    ToolTip.Tip="Force-reset sidetone (disable then re-enable)" />
                         </StackPanel>
                         <TextBlock x:Name="_sidetoneStatus"
                                    Text=""

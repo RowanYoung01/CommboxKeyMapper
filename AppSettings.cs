@@ -5,6 +5,8 @@ namespace ACU624KeyMapper;
 
 public enum ActionKind { None, Key, GamepadButton }
 
+public record BindEntry(string Label, ActionKind Kind, Keys Key = Keys.None, string? GamepadBtn = null);
+
 public class SwitchConfig
 {
     public int    ByteIndex   { get; set; } = -1;

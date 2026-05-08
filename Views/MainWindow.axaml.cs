@@ -102,7 +102,7 @@ public partial class MainWindow : Window
     private AppSettings      _settings = AppSettings.Load();
     private GamepadSimulator _gamepad  = new();
     private CoreAudioHelper? _audio;
-    private SidetoneEngine   _sidetone = new();
+    private SidetoneEngine   _sidetone = new(); // re-created with correct VID/PID after settings load
 
     // ── HID state ─────────────────────────────────────────────────────────
     private SafeFileHandle? _deviceHandle;
@@ -138,8 +138,9 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<string> _logItems = new();
 
     // ── Timers ────────────────────────────────────────────────────────────
-    private DispatcherTimer _volumeTimer  = null!;
-    private DispatcherTimer _monitorTimer = null!;
+    private DispatcherTimer  _volumeTimer    = null!;
+    private DispatcherTimer  _monitorTimer   = null!;
+    private DispatcherTimer? _reconnectTimer = null;
 
     public MainWindow()
     {
@@ -149,6 +150,9 @@ public partial class MainWindow : Window
 
     private void Init()
     {
+        // Re-create sidetone engine with the configured VID/PID from saved settings
+        _sidetone = new SidetoneEngine(_settings.DeviceVid, _settings.DevicePid);
+
         // Populate action dropdowns
         foreach (var e in AllBindings)
         {
@@ -166,14 +170,13 @@ public partial class MainWindow : Window
         _rightKeyCombo.SelectionChanged += (_, _) => OnActionChanged(1);
         _leftHoldChk.IsCheckedChanged   += (_, _) => OnHoldChanged(0);
         _rightHoldChk.IsCheckedChanged  += (_, _) => OnHoldChanged(1);
-        _displayAutoChk.IsCheckedChanged += OnDisplayAutoChanged;
-        _displayTextBox.TextChanged     += (_, _) => { if (!_settings.DisplayAuto) SendDisplayText(_displayTextBox.Text, force: true); };
-        _sendDisplayBtn.Click           += (_, _) => SendDisplayText(_displayTextBox.Text, force: true);
-        _sidetoneChk.IsCheckedChanged   += OnSidetoneToggle;
         _sidetoneSlider.ValueChanged    += (_, _) => OnSidetoneVolumeChanged();
+        _sidetoneResetBtn.Click         += (_, _) => ResetSidetone();
 
         // Log
         _logBox.ItemsSource = _logItems;
+        _logCopyBtn.Click  += (_, _) => CopyLogToClipboard();
+        _logClearBtn.Click += (_, _) => _logItems.Clear();
 
         // HID monitor dots
         InitButtonDots();
@@ -249,12 +252,8 @@ public partial class MainWindow : Window
         SetCombo(_rightKeyCombo, _settings.RightSwitch);
         _leftHoldChk.IsChecked  = _settings.LeftSwitch.HoldMode;
         _rightHoldChk.IsChecked = _settings.RightSwitch.HoldMode;
-        _displayAutoChk.IsChecked = _settings.DisplayAuto;
-        _displayTextBox.IsEnabled = !_settings.DisplayAuto;
-        if (!_settings.DisplayAuto) _displayTextBox.Text = _settings.DisplayCustomText;
         _sidetoneSlider.Value = Math.Clamp(_settings.SidetoneVolume, 0, 100);
         _sidetoneLbl.Text     = $"{_settings.SidetoneVolume} %";
-        _sidetoneChk.IsChecked = _settings.SidetoneEnabled;
         UpdateConfigLabel(0);
         UpdateConfigLabel(1);
     }
@@ -283,6 +282,8 @@ public partial class MainWindow : Window
     // ── Connection ────────────────────────────────────────────────────────
     private void TryConnect()
     {
+        _reconnectTimer?.Stop();
+        _reconnectTimer = null;
         StopReading();
         _audio?.Dispose();
         _audio = null;
@@ -312,6 +313,16 @@ public partial class MainWindow : Window
         SetStatus("Connected", BrushGreen, infoText);
         Log($"Connected: {infoText}");
 
+        // Cache output/feature report lengths so writes are padded correctly
+        DeviceDisplay.Setup(_deviceHandle);
+
+        // Restore endpoint and topology volumes to max — repairs any previously-lowered nodes
+        _sidetone.RestoreAllVolumes();
+
+        // Enable Windows mono audio while the app is running
+        SetMonoAudio(true);
+        Log("Mono audio enabled");
+
         // Dump HID report descriptor to log so we can see all VCS-SU reports
         Task.Run(() =>
         {
@@ -327,10 +338,18 @@ public partial class MainWindow : Window
         if (!_audio.IsAvailable)
             Log("Audio endpoint not found — volume monitoring unavailable");
 
-        SendDisplayText(null, force: true);
+        // Initialize LCD backlight and contrast (Backlit=1, Contrast=0 — same as VCSPosition)
+        DeviceDisplay.InitDisplay(_deviceHandle);
 
-        if (_settings.SidetoneEnabled)
-            OnSidetoneToggle(null, null!);
+        SendDisplayText();
+
+        // Sidetone is always active. Apply immediately; retry topology if endpoint not ready yet.
+        ApplySidetone();
+        if (_sidetone.LastError?.Contains("capture device not found") == true)
+        {
+            Log("Sidetone: audio endpoint not ready yet, will retry…");
+            RetryHardwareSidetone(attemptsLeft: 5);
+        }
 
         StartReadThread();
     }
@@ -342,16 +361,49 @@ public partial class MainWindow : Window
         _readThread.Start();
     }
 
+    private void RetryHardwareSidetone(int attemptsLeft)
+    {
+        if (attemptsLeft <= 0) return;
+        Task.Delay(2000).ContinueWith(_ =>
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (_deviceHandle == null || _deviceHandle.IsInvalid) return;
+                Log($"Sidetone retry (attempts left: {attemptsLeft - 1})…");
+                ApplySidetone();
+                if (_sidetone.LastError?.Contains("capture device not found") == true)
+                    RetryHardwareSidetone(attemptsLeft - 1);
+            }));
+    }
+
     private void StopReading()
     {
         _stopReading = true;
         _sidetone.StopSoftware();
+        DeviceDisplay.Reset();
         _deviceHandle?.Close();
         _deviceHandle = null;
         _readThread?.Join(500);
         _readThread = null;
         ReleaseIfHeld(ref _leftActive,  _settings.LeftSwitch);
         ReleaseIfHeld(ref _rightActive, _settings.RightSwitch);
+    }
+
+    private void StartAutoReconnect()
+    {
+        _reconnectTimer?.Stop();
+        _reconnectTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        _reconnectTimer.Tick += (_, _) =>
+        {
+            var paths = HidHelper.FindDevicePaths(_settings.DeviceVid, _settings.DevicePid);
+            if (paths.Count > 0)
+            {
+                _reconnectTimer?.Stop();
+                _reconnectTimer = null;
+                Log("Device detected — reconnecting…");
+                TryConnect();
+            }
+        };
+        _reconnectTimer.Start();
     }
 
     // ── HID read loop ─────────────────────────────────────────────────────
@@ -366,7 +418,12 @@ public partial class MainWindow : Window
             if (!HidHelper.ReadFile(_deviceHandle, buf, (uint)buf.Length, ref read, IntPtr.Zero) || read == 0)
             {
                 if (!_stopReading)
-                    Dispatcher.UIThread.Post(() => { SetStatus("Disconnected", BrushRed, ""); Log("Device disconnected"); });
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        SetStatus("Disconnected", BrushRed, "");
+                        Log("Device disconnected — will reconnect automatically");
+                        StartAutoReconnect();
+                    });
                 break;
             }
 
@@ -424,10 +481,10 @@ public partial class MainWindow : Window
         if (report.Length > 2)
         {
             byte b2 = report[2];
-            if ((b2 & 0x01) != 0) AdjustSidetone(-5);  // B15 left knob CCW
-            if ((b2 & 0x02) != 0) AdjustSidetone(+5);  // B16 left knob CW
-            if ((b2 & 0x04) != 0) AdjustSidetone(-1);  // B17 right knob CCW
-            if ((b2 & 0x08) != 0) AdjustSidetone(+1);  // B18 right knob CW
+            if ((b2 & 0x01) != 0) AdjustSidetone(-3);  // B15 left knob CCW
+            if ((b2 & 0x02) != 0) AdjustSidetone(+3);  // B16 left knob CW
+            if ((b2 & 0x04) != 0) AdjustSidetone(-3);  // B17 right knob CCW
+            if ((b2 & 0x08) != 0) AdjustSidetone(+3);  // B18 right knob CW
         }
     }
 
@@ -440,10 +497,9 @@ public partial class MainWindow : Window
         _sidetoneSlider.Value    = newVol;
         _sidetoneLbl.Text        = $"{newVol} %";
 
-        float vol = newVol / 100f;
-        _sidetone.SetSoftwareVolume(vol);
-        if (_sidetoneChk.IsChecked == true && _deviceHandle is { IsInvalid: false })
-            SidetoneEngine.TrySendHardwareReport(_deviceHandle, enable: true, level: (int)(vol * 63));
+        _sidetone.TrySetHardwareSidetone(true, newVol);
+        if (_deviceHandle != null && !_deviceHandle.IsInvalid)
+            SidetoneEngine.TryHidSidetone(_deviceHandle, true, newVol);
         Log($"Sidetone {newVol} %");
         _settings.Save();
     }
@@ -488,43 +544,19 @@ public partial class MainWindow : Window
             if (cfg.HoldMode) FireAction(cfg, down: false);
         }
 
-        if (_settings.DisplayAuto && _deviceHandle is { IsInvalid: false })
-            SendDisplayText(null, force: false);
     }
 
     // ── Device display ────────────────────────────────────────────────────
-    private void SendDisplayText(string? customText, bool force)
+    // Line 1: "PRIM STBY" — fixed status label (matches VCSPosition convention)
+    // Line 2: left key name (left-justified) + right key name (right-justified) in 16 chars
+    private void SendDisplayText()
     {
-        string line1, line2;
-        if (_settings.DisplayAuto || customText == null)
-        {
-            bool connected = _deviceHandle is { IsInvalid: false };
-            if (connected)
-            {
-                // Line 1: left indicator (left-aligned), Line 2: right indicator (right-aligned)
-                string leftLabel  = _settings.LeftSwitch.ActionKind  != ActionKind.None
-                                    ? GetSwitchLabel(0) : "LEFT ";
-                string rightLabel = _settings.RightSwitch.ActionKind != ActionKind.None
-                                    ? GetSwitchLabel(1) : "RIGHT";
-                char lc = _leftActive  ? '<' : ' ';
-                char rc = _rightActive ? '>' : ' ';
-                line1 = ($"{lc} {leftLabel,-14}")[..16];
-                line2 = ($"{rightLabel,14} {rc}")[..16];
-            }
-            else
-            {
-                line1 = "                ";
-                line2 = "                ";
-            }
-        }
-        else
-        {
-            _settings.DisplayCustomText = customText;
-            line1 = (customText + new string(' ', 16))[..16];
-            line2 = "                ";
-        }
+        string line1 = "<PRIM      STBY>"[..16];
+        string left  = GetSwitchLabel(0);
+        string right = GetSwitchLabel(1);
+        // Fit both labels into 16 chars: left-justified left, right-justified right
+        string line2 = $"<{left,-7}{right,7}>".PadRight(16)[..16];
 
-        // Preview shows line1 then line2 separated by newline
         _displayPreview.Text = line1.TrimEnd() + "\n" + line2.TrimEnd();
 
         if (_deviceHandle is { IsInvalid: false } hdl)
@@ -538,10 +570,16 @@ public partial class MainWindow : Window
     {
         var cfg = idx == 0 ? _settings.LeftSwitch : _settings.RightSwitch;
         if (cfg.ActionKind == ActionKind.Key)
-            return cfg.BoundKey.ToString()[..Math.Min(cfg.BoundKey.ToString().Length, 14)];
+        {
+            string key = cfg.BoundKey.ToString();
+            return key[..Math.Min(key.Length, 7)];
+        }
         if (cfg.ActionKind == ActionKind.GamepadButton)
-            return (cfg.GamepadButton ?? "BTN")[..Math.Min((cfg.GamepadButton ?? "BTN").Length, 14)];
-        return idx == 0 ? "LEFT " : "RIGHT";
+        {
+            string btn = cfg.GamepadButton ?? "BTN";
+            return btn[..Math.Min(btn.Length, 7)];
+        }
+        return idx == 0 ? "LEFT   " : "RIGHT  ";
     }
 
     // ── Audio levels ──────────────────────────────────────────────────────
@@ -568,6 +606,7 @@ public partial class MainWindow : Window
             Log("Warning: Xbox output requires ViGEmBus driver");
         _settings.Save();
         Log($"{(idx == 0 ? "Left" : "Right")} action → {entry.Label}");
+        SendDisplayText();
     }
 
     private void OnHoldChanged(int idx)
@@ -575,14 +614,6 @@ public partial class MainWindow : Window
         var chk = idx == 0 ? _leftHoldChk : _rightHoldChk;
         var cfg = idx == 0 ? _settings.LeftSwitch : _settings.RightSwitch;
         cfg.HoldMode = chk.IsChecked == true;
-        _settings.Save();
-    }
-
-    private void OnDisplayAutoChanged(object? sender, RoutedEventArgs e)
-    {
-        bool isAuto = _displayAutoChk.IsChecked == true;
-        _displayTextBox.IsEnabled = !isAuto;
-        _settings.DisplayAuto = isAuto;
         _settings.Save();
     }
 
@@ -663,6 +694,7 @@ public partial class MainWindow : Window
         if (!_reallyClose) { e.Cancel = true; HideToTray(); return; }
         _monitorTimer.Stop();
         _volumeTimer.Stop();
+        _reconnectTimer?.Stop();
         StopReading();
         DeviceDisplay.Clear(_deviceHandle!);
         _settings.Save();
@@ -670,6 +702,7 @@ public partial class MainWindow : Window
         _gamepad.Dispose();
         _audio?.Dispose();
         if (_notifyIcon != null) { _notifyIcon.Visible = false; _notifyIcon.Dispose(); }
+        SetMonoAudio(false);
     }
 
     private static bool IsInStartup()
@@ -706,34 +739,33 @@ public partial class MainWindow : Window
     }
 
     // ── Sidetone ──────────────────────────────────────────────────────────
-    private void OnSidetoneToggle(object? sender, RoutedEventArgs? e)
+    private void ResetSidetone()
     {
-        bool enabled = _sidetoneChk.IsChecked == true;
-        _settings.SidetoneEnabled = enabled;
-        _settings.Save();
+        Log("Sidetone reset…");
+        // Send full mute first, then re-enable — mimics the old toggle behaviour
+        if (_deviceHandle != null && !_deviceHandle.IsInvalid)
+            SidetoneEngine.TryHidSidetone(_deviceHandle, false, 0);
+        ApplySidetone();
+    }
 
-        if (!enabled)
-        {
-            _sidetone.StopSoftware();
-            if (_deviceHandle is { IsInvalid: false })
-                SidetoneEngine.TrySendHardwareReport(_deviceHandle, enable: false, level: 0);
-            _sidetoneStatus.Text       = "Disabled";
-            _sidetoneStatus.Foreground = BrushMuted;
-            Log("Sidetone disabled");
-            return;
-        }
+    private void ApplySidetone()
+    {
+        // 1. WASAPI device-topology path — unmutes the Windows-side audio node
+        bool hwOk = _sidetone.TrySetHardwareSidetone(true, _settings.SidetoneVolume);
+        if (!hwOk && _sidetone.LastError != null)
+            Log($"Sidetone HW topology error: {_sidetone.LastError}");
 
-        float vol = (float)(_sidetoneSlider.Value / 100.0);
-        bool hwOk = _deviceHandle is { IsInvalid: false } &&
-                    SidetoneEngine.TrySendHardwareReport(_deviceHandle, enable: true, level: (int)(vol * 63));
-        bool swOk = _sidetone.StartSoftware(vol);
+        // 2. HID Report ID 5 — controls the ACU-624D firmware's hardware sidetone mixer.
+        //    Always send this; it is what actually routes mic audio to headphone output.
+        bool hidOk = false;
+        if (_deviceHandle != null && !_deviceHandle.IsInvalid)
+            hidOk = SidetoneEngine.TryHidSidetone(_deviceHandle, true, _settings.SidetoneVolume);
 
-        string status = hwOk && swOk ? "Hardware + software routing active"
-                      : swOk        ? "Software routing active"
-                      : hwOk        ? "Hardware path sent (no audio endpoint)"
-                      :               "Failed — check ACU-624D is connected";
+        string status = hidOk ? $"Sidetone active ({_settings.SidetoneVolume}%)"
+                      : hwOk  ? $"Sidetone active — topology only ({_settings.SidetoneVolume}%)"
+                      :          "Failed — check ACU-624D is connected";
         _sidetoneStatus.Text       = status;
-        _sidetoneStatus.Foreground = (swOk || hwOk) ? BrushGreen : BrushRed;
+        _sidetoneStatus.Foreground = (hwOk || hidOk) ? BrushGreen : BrushRed;
         Log($"Sidetone: {status}");
     }
 
@@ -743,10 +775,28 @@ public partial class MainWindow : Window
         _sidetoneLbl.Text        = $"{pct} %";
         _settings.SidetoneVolume = pct;
         _settings.Save();
-        float vol = pct / 100f;
-        _sidetone.SetSoftwareVolume(vol);
-        if (_sidetoneChk.IsChecked == true && _deviceHandle is { IsInvalid: false })
-            SidetoneEngine.TrySendHardwareReport(_deviceHandle, enable: true, level: (int)(vol * 63));
+        _sidetone.TrySetHardwareSidetone(true, pct);
+        if (_deviceHandle != null && !_deviceHandle.IsInvalid)
+            SidetoneEngine.TryHidSidetone(_deviceHandle, true, pct);
+    }
+
+    // ── Mono audio ────────────────────────────────────────────────────────
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern bool SendNotifyMessage(IntPtr hWnd, uint msg, UIntPtr wParam, string lParam);
+    private const uint WM_SETTINGCHANGE = 0x001A;
+
+    private static void SetMonoAudio(bool mono)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser
+                .CreateSubKey(@"Software\Microsoft\Multimedia\Audio");
+            key.SetValue("AccessibilityMonoMixState", mono ? 1 : 0,
+                Microsoft.Win32.RegistryValueKind.DWord);
+            // Broadcast the change so Windows applies it immediately
+            SendNotifyMessage((IntPtr)0xFFFF, WM_SETTINGCHANGE, UIntPtr.Zero, "Accessibility");
+        }
+        catch { }
     }
 
     // ── Log ───────────────────────────────────────────────────────────────
@@ -754,5 +804,13 @@ public partial class MainWindow : Window
     {
         _logItems.Insert(0, $"{DateTime.Now:HH:mm:ss}  {msg}");
         if (_logItems.Count > 200) _logItems.RemoveAt(_logItems.Count - 1);
+    }
+
+    private async void CopyLogToClipboard()
+    {
+        var text = string.Join(Environment.NewLine, _logItems);
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard != null)
+            await clipboard.SetTextAsync(text);
     }
 }

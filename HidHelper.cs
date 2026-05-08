@@ -49,6 +49,12 @@ public static class HidHelper
     [DllImport("hid.dll")]
     public static extern bool HidD_GetAttributes(SafeFileHandle device, ref HIDD_ATTRIBUTES attributes);
 
+    [DllImport("hid.dll")]
+    public static extern bool HidD_SetFeature(SafeFileHandle device, byte[] reportBuffer, uint bufferLength);
+
+    [DllImport("hid.dll")]
+    public static extern bool HidD_GetFeature(SafeFileHandle device, byte[] reportBuffer, uint bufferLength);
+
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, IntPtr Enumerator,
         IntPtr hwndParent, uint Flags);
@@ -102,6 +108,9 @@ public static class HidHelper
 
     private enum HidReportType { Input = 0, Output = 1, Feature = 2 }
 
+    // HidP_* functions return this NTSTATUS on success (not 0)
+    private const int HIDP_STATUS_SUCCESS = 0x00110000;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct HIDP_CAPS
     {
@@ -122,7 +131,7 @@ public static class HidHelper
         public ushort NumberFeatureDataIndices;
     }
 
-    // Simplified — the union contains either Range or NotRange; we read both positions
+    // Must match HIDP_VALUE_CAPS exactly (72 bytes on x64 with default packing).
     [StructLayout(LayoutKind.Sequential)]
     private struct HIDP_VALUE_CAPS
     {
@@ -131,9 +140,14 @@ public static class HidHelper
         public ushort LinkUsage; public ushort LinkUsagePage;
         public byte IsRange; public byte IsStringRange; public byte IsDesignatorRange; public byte HasNull;
         public byte NullValue; public byte BitSize;
-        public ushort ReportCount; public ushort Reserved2; public uint Reserved3;
-        public uint LogicalMin; public uint LogicalMax;
-        public uint PhysicalMin; public uint PhysicalMax;
+        public ushort ReportCount;
+        // Reserved[5] — 5 × USHORT = 10 bytes (was missing, causing 18-byte underrun)
+        private ushort _r0, _r1, _r2, _r3, _r4;
+        // UnitsExp + Units — 8 bytes (was missing)
+        public uint UnitsExp; public uint Units;
+        // Logical / Physical range
+        public int LogicalMin; public int LogicalMax;
+        public int PhysicalMin; public int PhysicalMax;
         // Union: Range (UsageMin/Max) or NotRange (Usage/Reserved)
         public ushort UsageMin; public ushort UsageMax;
         public ushort StringMin; public ushort StringMax;
@@ -158,6 +172,23 @@ public static class HidHelper
     // ── Public API ────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Returns the Output and Feature report byte lengths (including Report ID byte)
+    /// as declared in the device's HID descriptor. WriteFile and HidD_SetFeature require
+    /// buffers padded to exactly these lengths.
+    /// </summary>
+    public static (int outputLen, int featureLen) GetReportLengths(SafeFileHandle handle)
+    {
+        if (handle == null || handle.IsInvalid) return (0, 0);
+        if (!HidD_GetPreparsedData(handle, out IntPtr preparsed)) return (0, 0);
+        try
+        {
+            if (HidP_GetCaps(preparsed, out HIDP_CAPS caps) != HIDP_STATUS_SUCCESS) return (0, 0);
+            return (caps.OutputReportByteLength, caps.FeatureReportByteLength);
+        }
+        finally { HidD_FreePreparsedData(preparsed); }
+    }
+
+    /// <summary>
     /// Returns a multi-line string describing all HID reports on the device:
     /// usage pages, report IDs, byte lengths, and per-report value/button usages.
     /// </summary>
@@ -170,7 +201,7 @@ public static class HidHelper
         if (!HidD_GetPreparsedData(h, out IntPtr preparsed)) return "HidD_GetPreparsedData failed";
         try
         {
-            if (HidP_GetCaps(preparsed, out HIDP_CAPS caps) != 0) return "HidP_GetCaps failed";
+            if (HidP_GetCaps(preparsed, out HIDP_CAPS caps) != HIDP_STATUS_SUCCESS) return "HidP_GetCaps failed";
 
             sb.AppendLine($"Top-level Usage: Page=0x{caps.UsagePage:X4}  Usage=0x{caps.Usage:X4}");
             sb.AppendLine($"Report lengths — In:{caps.InputReportByteLength}  Out:{caps.OutputReportByteLength}  Feat:{caps.FeatureReportByteLength}");
@@ -190,14 +221,14 @@ public static class HidHelper
                 if (valCount > 0)
                 {
                     var vcaps = new HIDP_VALUE_CAPS[valCount];
-                    if (HidP_GetValueCaps(rtype, vcaps, ref valCount, preparsed) == 0)
+                    if (HidP_GetValueCaps(rtype, vcaps, ref valCount, preparsed) == HIDP_STATUS_SUCCESS)
                         foreach (var vc in vcaps)
                             sb.AppendLine($"  {rtype} VALUE  RptID=0x{vc.ReportID:X2}  Page=0x{vc.UsagePage:X4}  Usage=0x{vc.UsageMin:X4}  Bits={vc.BitSize}  Log=[{vc.LogicalMin}..{vc.LogicalMax}]");
                 }
                 if (btnCount > 0)
                 {
                     var bcaps = new HIDP_BUTTON_CAPS[btnCount];
-                    if (HidP_GetButtonCaps(rtype, bcaps, ref btnCount, preparsed) == 0)
+                    if (HidP_GetButtonCaps(rtype, bcaps, ref btnCount, preparsed) == HIDP_STATUS_SUCCESS)
                         foreach (var bc in bcaps)
                             sb.AppendLine($"  {rtype} BUTTON RptID=0x{bc.ReportID:X2}  Page=0x{bc.UsagePage:X4}  Usage=0x{bc.UsageMin:X4}..0x{bc.UsageMax:X4}");
                 }
@@ -322,9 +353,27 @@ public static class DeviceDisplay
     private const byte ReportIdCursor = 0x02;
     private const byte ReportIdChars  = 0x03;
 
+    // Cached from HID descriptor — WriteFile requires exactly this many bytes per report.
+    private static int _outputLen;
+
+    /// <summary>
+    /// Reads and caches the output report byte length from the device descriptor.
+    /// Must be called once after opening the device handle, before any Write calls.
+    /// </summary>
+    public static void Setup(SafeFileHandle handle)
+    {
+        var (outLen, _) = HidHelper.GetReportLengths(handle);
+        _outputLen = outLen > 0 ? outLen : 0;
+    }
+
+    public static void Reset() => _outputLen = 0;
+
     private static bool SetCursor(SafeFileHandle handle, int row, int col)
     {
-        var report = new byte[] { ReportIdCursor, (byte)((row << 4) | (col & 0x0F)) };
+        int len    = Math.Max(_outputLen, 2);
+        var report = new byte[len];
+        report[0] = ReportIdCursor;
+        report[1] = (byte)((row << 4) | (col & 0x0F));
         uint written = 0;
         return HidHelper.WriteFile(handle, report, (uint)report.Length, ref written, IntPtr.Zero)
                && written == report.Length;
@@ -332,7 +381,8 @@ public static class DeviceDisplay
 
     private static bool WriteChunk(SafeFileHandle handle, ReadOnlySpan<char> chars4)
     {
-        var report = new byte[5];
+        int len    = Math.Max(_outputLen, 5);
+        var report = new byte[len];
         report[0] = ReportIdChars;
         for (int i = 0; i < 4; i++)
         {
@@ -364,4 +414,25 @@ public static class DeviceDisplay
 
     public static bool Clear(SafeFileHandle handle) =>
         Write2Lines(handle, "                ", "                ");
+
+    /// <summary>
+    /// Sends the display-settings Feature Report (Report ID 0x01) to the ACU-624D.
+    /// VCSPosition.exe configures: Backlit = 1 (on), Contrast = 0 (max visibility).
+    ///
+    /// Report ID 1 layout (2-byte Feature Report body after the ID byte):
+    ///   Byte 0:  bit 0 = Backlit (1 = on)
+    ///            bits 6:1 = Contrast (0 = best, 63 = faded)
+    ///   Byte 1:  reserved / padding
+    ///
+    /// NOTE: the exact layout was inferred from VCS INI config and binary analysis.
+    /// If the display remains dark, run the app with the device connected and read the
+    /// DumpReportCaps log output to confirm the Feature Report structure.
+    /// </summary>
+    public static bool InitDisplay(SafeFileHandle handle, bool backlit = true, byte contrast = 0)
+    {
+        if (handle == null || handle.IsInvalid) return false;
+        byte settings = (byte)((backlit ? 1 : 0) | ((contrast & 0x3F) << 1));
+        var report = new byte[] { 0x01, settings, 0x00 };
+        return HidHelper.HidD_SetFeature(handle, report, (uint)report.Length);
+    }
 }
